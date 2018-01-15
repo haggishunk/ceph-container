@@ -22,6 +22,9 @@ function zap_device {
   else
     # testing all the devices first so we just don't do anything if one device is wrong
     for device in $(comma_to_space "${OSD_DEVICE}"); do
+      partitions=$(get_child_partitions "${device}")
+      declare -A to_wipe
+      for p in $partitions; do to_wipe[$p]="$(get_start_pos_partition "${p}")"; done
       if [[ $(stat --format=%F "$device" 2> /dev/null) != "block special file" ]]; then
         log "Provided device $device does not exist."
         exit 1
@@ -33,16 +36,24 @@ function zap_device {
         log "Do not use your system disk!"
         exit 1
       fi
-    done
 
-    # look for Ceph encrypted partitions
-    local ceph_dm
-    ceph_dm=$(blkid -t TYPE="crypto_LUKS" "${OSD_DEVICE}"* -o value -s PARTUUID || true)
-    if [[ -n $ceph_dm ]]; then
-      for dm_uuid in $ceph_dm; do
+      # look for Ceph encrypted partitions
+      local ceph_dm
+      ceph_dm=$(blkid -t TYPE="crypto_LUKS" "${device}"* -o value -s PARTUUID || true)
+      opened_dm=$(dmsetup ls --exec 'basename' --target crypt)
+
+      if [[ -n $ceph_dm ]]; then
+        for dm_uuid in $ceph_dm; do
+          for dm in $opened_dm; do
+            if [ "${dm_uuid}" == "${dm}" ]; then
+              cryptsetup luksClose /dev/mapper/"${dm_uuid}"
+            fi
+          done
+        done
+
         local dm_path="/dev/disk/by-partuuid/$dm_uuid"
         dmsetup --verbose --force wipe_table "$dm_uuid" || true
-        dmsetup --verbose --force remove "$dm_uuid" || true
+        dmsetup --verbose --force remove --retry "$dm_uuid" || true
 
         # erase all keyslots (remove encryption key)
         cryptsetup --verbose --batch-mode erase "$dm_path"
@@ -56,25 +67,15 @@ function zap_device {
         fi
         # remove LUKS header
         dd if=/dev/zero of="$dm_path" bs="$phys_sector_size" count="$payload_offset" oflag=direct
-      done
-    fi
-
-    for device in $(comma_to_space "${OSD_DEVICE}"); do
-      local raw_device
-      raw_device=$(echo "$device" | grep -oE "${device_match_string}")
-      if echo "$device" | grep -sqE "${device_match_string}"; then
-        log "Zapping the entire device $device"
-        sgdisk --zap-all --clear --mbrtogpt -g -- "$device"
-      else
-        # get the desired partition number(s)
-        local partition_nb
-        partition_nb=$(echo "$device" | grep -oE '[0-9]{1,2}$')
-        log "Zapping partition $device"
-        sgdisk --delete "$partition_nb" "$raw_device"
       fi
-      log "Executing partprobe on $raw_device"
-      partprobe "$raw_device"
+
+      log "Zapping the entire device $device"
+      for key in "${!to_wipe[@]}"; do dd if=/dev/zero of="${key}" seek="${to_wipe["${key}"]}" bs=1 count=4096; done
+      sgdisk --zap-all --clear --mbrtogpt -g -- "$device"
+      log "Executing partprobe on ${device}"
+      partprobe "${device}"
       udevadm settle
+      dd if=/dev/zero of="${device}" bs=1M count=10
     done
   fi
 }
